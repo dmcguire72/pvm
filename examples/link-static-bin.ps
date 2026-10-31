@@ -1,0 +1,35 @@
+extern add3, sqrt, count_to
+import "mathlib.bin"
+
+call main
+halt 0
+
+main:
+    pushs "a = 10 + 8 + 7 = "
+    prints
+    push 10
+    push 8
+    push 7
+    call add3
+    dup
+    store r0
+    printi
+    newline
+
+    pushs "sqrt(sqrt(a) - 1) = "
+    prints
+    load r0
+    call sqrt
+    push 1
+    sub
+    call sqrt
+    printi
+    newline
+
+    pushs "1 to 9:\n"
+    prints
+    push 9
+    call count_to
+    ret
+
+end

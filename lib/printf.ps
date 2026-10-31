@@ -1,0 +1,313 @@
+;   %d - integers
+;   %s - strings
+;   %c - characters
+;   %% - literal percent
+
+export printf, fprintf, sprintf
+
+var out_buf, dst_ptr, fprintf_fd, fprintf_str
+var str_dst, str_src
+var itoa_dst, itoa_val, itoa_count, itoa_buf
+var strlen_ptr, strlen_count
+
+; in: [argN, ..., arg1, fmt_ptr]
+; out: [allocated_str_ptr]
+sprintf:
+    push 4096
+    mkheap
+    dup
+    store out_buf
+    store dst_ptr
+
+.sprintf_loop:
+    dup
+    loadb
+    
+    dup
+    jz .sprintf_done_from_loop
+    
+    dup
+    push 37
+    eq
+    jnz .sprintf_format
+    
+    load dst_ptr
+    swap
+    storeb
+    
+    load dst_ptr
+    push 1
+    add
+    store dst_ptr
+    
+    push 1
+    add
+    jmp .sprintf_loop
+
+.sprintf_format:
+    pop
+    push 1
+    add
+    
+    dup
+    loadb
+    
+    dup
+    jz .sprintf_done_from_loop
+    
+    dup
+    push 37            ; '%'
+    eq
+    jnz .fmt_percent
+    
+    dup
+    push 100           ; 'd'
+    eq
+    jnz .fmt_d
+    
+    dup
+    push 115           ; 's'
+    eq
+    jnz .fmt_s
+    
+    dup
+    push 99            ; 'c'
+    eq
+    jnz .fmt_c
+    
+    pop
+    jmp .sprintf_loop
+
+.fmt_percent:
+    pop
+    load dst_ptr
+    push 37            ; '%'
+    storeb
+    
+    load dst_ptr
+    push 1
+    add
+    store dst_ptr
+    
+    push 1
+    add
+    jmp .sprintf_loop
+
+.fmt_c:
+    pop
+    push 1
+    add
+    swap
+    
+    load dst_ptr
+    swap
+    storeb
+    
+    load dst_ptr
+    push 1
+    add
+    store dst_ptr
+    jmp .sprintf_loop
+
+.fmt_d:
+    pop
+    push 1
+    add
+    swap
+    
+    load dst_ptr
+    swap
+    call itoa
+    store dst_ptr
+    jmp .sprintf_loop
+
+.fmt_s:
+    pop
+    push 1
+    add
+    swap
+    
+    load dst_ptr
+    swap
+    call strcpy
+    store dst_ptr
+    jmp .sprintf_loop
+
+.sprintf_done_from_loop:
+    pop
+.sprintf_done:
+    pop
+    load dst_ptr
+    push 0
+    storeb
+    load out_buf
+    ret
+
+; in: [argN, ..., arg1, fmt_ptr]
+printf:
+    call sprintf
+    dup
+    prints
+    rmheap
+    ret
+
+; in: [argN, ..., arg1, fmt_ptr, fd]
+fprintf:
+    store fprintf_fd
+    call sprintf
+    store fprintf_str
+
+    load fprintf_fd
+    load fprintf_str
+    
+    load fprintf_str
+    call strlen
+    
+    write
+    pop
+    
+    load fprintf_str
+    rmheap
+    ret
+
+; in: [str_ptr]
+; out: [len]
+strlen:
+    store strlen_ptr
+    push 0
+    store strlen_count
+.strlen_loop:
+    load strlen_ptr
+    loadb
+    jz .strlen_done
+    
+    load strlen_count
+    push 1
+    add
+    store strlen_count
+    
+    load strlen_ptr
+    push 1
+    add
+    store strlen_ptr
+    jmp .strlen_loop
+.strlen_done:
+    load strlen_count
+    ret
+
+; in: [dst, src]
+; out: [updated_dst]
+strcpy:
+    store str_src
+    store str_dst
+.strcpy_loop:
+    load str_src
+    loadb
+    dup
+    jz .strcpy_done
+    
+    load str_dst
+    swap
+    storeb
+    
+    load str_src
+    push 1
+    add
+    store str_src
+    
+    load str_dst
+    push 1
+    add
+    store str_dst
+    jmp .strcpy_loop
+.strcpy_done:
+    pop
+    load str_dst
+    ret
+
+; in: [dst, val]
+; out [updated_dst]
+itoa:
+    store itoa_val
+    store itoa_dst
+    push 0
+    store itoa_count
+    
+    push 32
+    mkheap
+    store itoa_buf
+    
+    load itoa_val
+    push 0
+    ge
+    jnz .itoa_digit_loop
+    
+    load itoa_dst
+    push 45            ; '-'
+    storeb
+    load itoa_dst
+    push 1
+    add
+    store itoa_dst
+    push 0
+    load itoa_val
+    sub
+    store itoa_val
+
+.itoa_digit_loop:
+    load itoa_val
+    push 10
+    mod
+    push 48
+    add
+    
+    load itoa_buf
+    load itoa_count
+    add
+    swap
+    storeb
+    
+    load itoa_count
+    push 1
+    add
+    store itoa_count
+    
+    load itoa_val
+    push 10
+    div
+    store itoa_val
+    
+    load itoa_val
+    jz .itoa_write_loop
+    jmp .itoa_digit_loop
+
+.itoa_write_loop:
+    load itoa_count
+    jz .itoa_done
+    
+    load itoa_count
+    push 1
+    sub
+    store itoa_count
+    
+    load itoa_dst
+    load itoa_buf
+    load itoa_count
+    add
+    loadb
+    storeb
+    
+    load itoa_dst
+    push 1
+    add
+    store itoa_dst
+    jmp .itoa_write_loop
+
+.itoa_done:
+    load itoa_buf
+    rmheap
+
+    load itoa_dst
+    ret
+
+end

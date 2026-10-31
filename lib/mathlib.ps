@@ -1,0 +1,315 @@
+export add3, sub3, mul3, div3
+export abs, sign, min, max
+export pow, sqrt
+export floor_div, ceil_div, round_div
+export srand, rand, randn
+export count_to
+
+; count_to
+var limit, i
+; pow / sqrt / division
+var n, x, y, q, r, t  
+; rand  
+var rng
+
+add3:
+    add
+    add
+    ret
+
+sub3:
+    add
+    sub
+    ret
+
+mul3:
+    mul
+    mul
+    ret
+
+div3:
+    store t
+    div
+    load t
+    div
+    ret
+
+abs:
+    dup
+    push 0
+    lt
+    jz abs_done
+    neg
+abs_done:
+    ret
+
+sign:
+    dup
+    push 0
+    gt
+    jnz sign_pos
+    push 0
+    lt
+    neg
+    ret
+sign_pos:
+    pop
+    push 1
+    ret
+
+min:
+    over
+    over
+    lt
+    jnz min_keep_a
+    swap
+min_keep_a:
+    pop
+    ret
+
+max:
+    over
+    over
+    gt
+    jnz max_keep_a
+    swap
+max_keep_a:
+    pop
+    ret
+
+pow:
+    store n
+    store x
+    push 1
+    store y
+    load n
+    push 0
+    lt
+    jnz pow_neg
+pow_loop:
+    load n
+    jz pow_done
+    load n
+    push 2
+    mod
+    jz pow_even
+    load y
+    load x
+    mul
+    store y
+pow_even:
+    load x
+    load x
+    mul
+    store x
+    load n
+    push 2
+    div
+    store n
+    jmp pow_loop
+pow_done:
+    load y
+    ret
+pow_neg:
+    push 0
+    ret
+
+sqrt:
+    store n
+    load n
+    push 0
+    le
+    jnz sqrt_zero
+    load n
+    store x
+sqrt_loop:
+    load n
+    load x
+    div
+    store y
+    load y
+    load x
+    load y
+    sub
+    push 2
+    div
+    add
+    dup
+    load x
+    ge
+    jnz sqrt_done
+    store x
+    jmp sqrt_loop
+sqrt_done:
+    pop
+    load x
+    ret
+sqrt_zero:
+    push 0
+    ret
+
+floor_div:
+    store y
+    store x
+    load x
+    load y
+    div
+    store q
+    load x
+    load y
+    mod
+    jz floor_done
+    load x
+    push 0
+    lt
+    load y
+    push 0
+    lt
+    ne
+    jz floor_done
+    load q
+    push 1
+    sub
+    store q
+floor_done:
+    load q
+    ret
+
+ceil_div:
+    store y
+    store x
+    load x
+    load y
+    div
+    store q
+    load x
+    load y
+    mod
+    jz ceil_done
+    load x
+    push 0
+    lt
+    load y
+    push 0
+    lt
+    eq
+    jz ceil_done
+    load q
+    push 1
+    add
+    store q
+ceil_done:
+    load q
+    ret
+
+round_div:
+    store y
+    store x
+    load x
+    load y
+    div
+    store q
+    load x
+    load y
+    mod
+    store r
+    load r
+    call abs
+    load y
+    call abs
+    load r
+    call abs
+    sub
+    ge
+    jz round_done
+    load x
+    push 0
+    lt
+    load y
+    push 0
+    lt
+    eq
+    jz round_neg
+    load q
+    push 1
+    add
+    store q
+    jmp round_done
+round_neg:
+    load q
+    push 1
+    sub
+    store q
+round_done:
+    load q
+    ret
+
+srand:
+    push 65535
+    and
+    dup
+    jnz srand_ok
+    pop
+    push 1
+srand_ok:
+    store rng
+    ret
+
+rand:
+    load rng
+    jnz rand_step
+    push 44257
+    store rng
+rand_step:
+    load rng
+    dup
+    push 7
+    shl
+    push 65535
+    and
+    xor
+    dup
+    push 9
+    shr
+    xor
+    dup
+    push 8
+    shl
+    push 65535
+    and
+    xor
+    dup
+    store rng
+    push 32767
+    and
+    ret
+
+randn:
+    call rand
+    swap
+    mod
+    ret
+
+count_to:
+    store limit
+    push 1
+    store i
+count_to_loop:
+    load i
+    load limit
+    gt
+    jnz count_to_done
+    load i
+    printi
+    pushs " "
+    prints
+    load i
+    push 1
+    add
+    store i
+    jmp count_to_loop
+count_to_done:
+    newline
+    ret
+
+end

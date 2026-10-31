@@ -1,0 +1,302 @@
+export run_bf
+
+var heap, tape_base, tape_ptr, ip, code_end, instr, scan, depth, zp
+var src_ptr
+
+run_bf:
+    store src_ptr
+
+    push 16384
+    mkheap
+    store heap
+
+    load heap
+    push 4096
+    add
+    store tape_base
+    load tape_base
+    store tape_ptr
+
+    load tape_base
+    store zp
+clear_loop:
+    load zp
+    push 0
+    storeb
+    load zp
+    push 1
+    add
+    store zp
+    load zp
+    load tape_base
+    push 12288
+    add
+    eq
+    jz clear_loop
+
+    load heap
+    store ip
+
+filter_loop:
+    load src_ptr
+    loadb
+    dup
+    jz end_filter
+
+    dup
+    push 62     ; '>'
+    eq
+    over
+    push 60     ; '<'
+    eq
+    or
+    over
+    push 43     ; '+'
+    eq
+    or
+    over
+    push 45     ; '-'
+    eq
+    or
+    over
+    push 46     ; '.'
+    eq
+    or
+    over
+    push 44     ; ','
+    eq
+    or
+    over
+    push 91     ; '['
+    eq
+    or
+    over
+    push 93     ; ']'
+    eq
+    or
+    jz skip_char
+    
+    load ip
+    swap
+    storeb
+    
+    load ip
+    push 1
+    add
+    store ip
+
+    load ip
+    load tape_base
+    ult
+    jnz next_char
+
+    pushs "Error: program too large (max 4095 instructions)\n"
+    prints
+    jmp crash
+
+skip_char:
+    pop
+
+next_char:
+    load src_ptr
+    push 1
+    add
+    store src_ptr
+    jmp filter_loop
+
+end_filter:
+    pop
+    load ip
+    store code_end
+
+    load heap
+    store ip
+
+exec_loop:
+    load ip
+    load code_end
+    eq
+    jnz end_exec
+    
+    load ip
+    loadb
+    store instr
+    
+    ; [>] ptr increment
+    load tape_ptr
+    load instr
+    push 62
+    eq
+    load instr
+    push 60
+    eq
+    sub
+    add
+    store tape_ptr
+
+    ; tp below?
+    load tape_ptr
+    load tape_base
+    ult
+    jz ptr_underflow_ok
+        pushs "\nError: tape pointer underflow\n"
+        prints
+        jmp crash
+    ptr_underflow_ok:
+
+    ; tp past end?
+    load tape_ptr
+    load tape_base
+    push 12288
+    add
+    uge
+    jz ptr_overflow_ok
+        pushs "\nError: tape pointer overflow\n"
+        prints
+        jmp crash
+    ptr_overflow_ok:
+    
+    ; [+] data increment
+    load tape_ptr
+    dup
+    loadb
+    load instr
+    push 43
+    eq
+    load instr
+    push 45
+    eq
+    sub
+    add
+    storeb
+    
+    ; [.] print
+    load instr
+    push 46
+    eq
+    jz not_dot
+    load tape_ptr
+    loadb
+    printc
+not_dot:
+
+    ; [,] read
+    load instr
+    push 44
+    eq
+    jz not_comma
+    load tape_ptr
+    readc
+    dup
+    push -1
+    eq
+    jz store_c
+    pop
+    push 0
+store_c:
+    storeb
+not_comma:
+
+    ; [ [ ] loop start
+    load instr
+    push 91
+    eq
+    jz not_lbracket
+    load tape_ptr
+    loadb
+    jnz not_lbracket
+    push 1
+    store depth
+scan_fwd:
+    load ip
+    push 1
+    add
+    store ip
+
+    ; ran off end?
+    load ip
+    load code_end
+    uge
+    jz fwd_bounds_ok
+        pushs "\nError: unmatched '['\n"
+        prints
+        jmp crash
+    fwd_bounds_ok:
+
+    load ip
+    loadb
+    store scan
+    load depth
+    load scan
+    push 91
+    eq
+    load scan
+    push 93
+    eq
+    sub
+    add
+    store depth
+    load depth
+    jnz scan_fwd
+not_lbracket:
+
+    ; [ ] ] loop end
+    load instr
+    push 93
+    eq
+    jz not_rbracket
+    load tape_ptr
+    loadb
+    jz not_rbracket
+    push 1
+    store depth
+scan_bwd:
+    load ip
+    push 1
+    sub
+    store ip
+
+    ; ran off start?
+    load ip
+    load heap
+    ult
+    jz bwd_bounds_ok
+        pushs "\nError: unmatched ']'\n"
+        prints
+        jmp crash
+
+bwd_bounds_ok:
+    load ip
+    loadb
+    store scan
+    load depth
+    load scan
+    push 93
+    eq
+    load scan
+    push 91
+    eq
+    sub
+    add
+    store depth
+    load depth
+    jnz scan_bwd
+
+not_rbracket:
+    load ip
+    push 1
+    add
+    store ip
+    jmp exec_loop
+
+end_exec:
+    load heap
+    rmheap
+    push 0
+    ret
+
+crash:
+    load heap
+    rmheap
+    push 1
+    ret

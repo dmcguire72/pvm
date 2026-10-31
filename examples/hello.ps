@@ -1,0 +1,13 @@
+extern printf
+import "../lib/printf.ps"
+
+push 92
+push 20
+add
+push 20
+push 92
+pushs "Hello, World!"
+pushs "%s %d + %d = %d\n"
+call printf
+
+end

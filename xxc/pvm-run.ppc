@@ -1,0 +1,981 @@
+/*
+ * PVM (++C)
+ *
+ * Copyright (C) 2026 Daniel McGuire
+ * Licensed under the Apache 2.0 License.
+ */
+#include <def.h>
+#include <alloc.h>
+#include <mem.h>
+#include <str.h>
+#include <cio.h>
+#include <parr.h>
+#include <map.h>
+#include <class.pph>
+#include <stream.pph>
+#include <files.pph>
+#include <ios.pph>
+
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(XXC_RAWSYS)
+#include <xxc_sys.h>
+#endif
+
+#include "pvm-common-xxc.h"
+
+#define VM_INTPTR_MIN ((intptr_t)((uintptr_t)1 << (sizeof(intptr_t) * 8 - 1)))
+#define VM_WORD_BITS  ((uintptr_t)(sizeof(intptr_t) * 8))
+#define MAXFILES      1024
+#define ERRBUF        512
+
+static u8     g_out[4096];
+static size_t g_out_len;
+
+static u8     g_in[4096];
+static size_t g_in_pos;
+static size_t g_in_len;
+
+static void raw_write(Stream *s, const u8 *p, size_t n)
+{
+    while (n > 0)
+    {
+        i64 k = CALL2(s, write, p, n);
+        if (k <= 0) break;
+        p += (size_t)k;
+        n -= (size_t)k;
+    }
+}
+
+static void out_flush(void)
+{
+    if (g_out_len > 0)
+    {
+        Stream *so = cout();
+        raw_write(so, g_out, g_out_len);
+        g_out_len = 0;
+    }
+}
+
+static void out_write(const void *data, size_t n)
+{
+    const u8 *p = (const u8 *)data;
+    while (n > 0)
+    {
+        if (g_out_len == sizeof(g_out)) out_flush();
+        size_t room = sizeof(g_out) - g_out_len;
+        size_t k = n < room ? n : room;
+        memcpy(g_out + g_out_len, p, k);
+        g_out_len += k;
+        p += k;
+        n -= k;
+    }
+}
+
+static void out_str(const char *s)  { out_write(s, strlen(s)); }
+static void out_char(char c)        { out_write(&c, 1); }
+
+static void out_int(intptr_t v)
+{
+    char buf[32];
+    int  i = (int)sizeof(buf);
+    uintptr_t u = (uintptr_t)v;
+    bool neg = v < 0;
+    if (neg) u = 0 - u;
+    do { buf[--i] = (char)('0' + (u % 10)); u /= 10; } while (u != 0);
+    if (neg) buf[--i] = '-';
+    out_write(buf + i, sizeof(buf) - (size_t)i);
+}
+
+static void err_str(const char *s)
+{
+    out_flush();
+    Stream *se = cerr();
+    raw_write(se, (const u8 *)s, strlen(s));
+}
+
+static bool in_fill(void)
+{
+    if (g_in_pos < g_in_len) return true;
+    out_flush();
+    Stream *si = cin();
+    i64 r = CALL2(si, read, g_in, sizeof(g_in));
+    if (r <= 0) return false;
+    g_in_pos = 0;
+    g_in_len = (size_t)r;
+    return true;
+}
+
+static int in_peek(void) { return in_fill() ? g_in[g_in_pos] : -1; }
+static int in_get(void)  { return in_fill() ? g_in[g_in_pos++] : -1; }
+
+static bool is_space(int c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+static bool is_digit(int c) { return c >= '0' && c <= '9'; }
+
+typedef struct { Instr *v; size_t len, cap; } Prog;
+typedef struct { char **v; size_t len, cap; } Pool;
+
+static bool prog_push(Prog *p, OpCode op, intptr_t arg)
+{
+    if (p->len == p->cap)
+    {
+        size_t ncap = p->cap ? p->cap * 2 : 256;
+        Instr *nv = (Instr *)realloc(p->v, ncap * sizeof(Instr));
+        if (nv == nullptr) return false;
+        p->v = nv;
+        p->cap = ncap;
+    }
+    p->v[p->len].op = op;
+    p->v[p->len].arg = arg;
+    p->len++;
+    return true;
+}
+
+static char *pool_add(Pool *pl, const char *s, size_t n)
+{
+    if (pl->len == pl->cap)
+    {
+        size_t ncap = pl->cap ? pl->cap * 2 : 64;
+        char **nv = (char **)realloc(pl->v, ncap * sizeof(char *));
+        if (nv == nullptr) return nullptr;
+        pl->v = nv;
+        pl->cap = ncap;
+    }
+    char *c = (char *)malloc(n + 1);
+    if (c == nullptr) return nullptr;
+    memcpy(c, s, n);
+    c[n] = '\0';
+    pl->v[pl->len++] = c;
+    return c;
+}
+
+typedef enum { LOAD_OK, LOAD_NOT_FOUND, LOAD_INVALID } LoadStatus;
+
+static void set_err(char *err, const char *msg)
+{
+    size_t n = strlen(msg);
+    if (n >= ERRBUF) n = ERRBUF - 1;
+    memcpy(err, msg, n);
+    err[n] = '\0';
+}
+
+static u8 *slurp(const char *path, size_t *out_len, bool *oom)
+{
+    *oom = false;
+    Stream *f = fopen_str(path, "r");
+    if (f == nullptr) return nullptr;
+
+    u8 *buf = nullptr;
+    size_t len = 0, cap = 0;
+    for (;;)
+    {
+        if (cap - len < 4096)
+        {
+            size_t ncap = cap ? cap * 2 : 8192;
+            u8 *nb = (u8 *)realloc(buf, ncap);
+            if (nb == nullptr) { free(buf); REMOVE(f); *oom = true; return nullptr; }
+            buf = nb;
+            cap = ncap;
+        }
+        i64 r = CALL2(f, read, buf + len, cap - len);
+        if (r <= 0) break;
+        len += (size_t)r;
+    }
+    REMOVE(f);
+    if (buf == nullptr) { buf = (u8 *)malloc(1); }
+    *out_len = len;
+    return buf;
+}
+
+static LoadStatus read_module(const char *filename, Prog *out, Pool *pool,
+                              char *err, u8 *flags)
+{
+    size_t n = 0;
+    bool oom = false;
+    u8 *data = slurp(filename, &n, &oom);
+    if (data == nullptr)
+    {
+        if (oom) { set_err(err, "Out of memory."); return LOAD_INVALID; }
+        snprintf(err, ERRBUF, "Failed to open bytecode file: %s", filename);
+        return LOAD_NOT_FOUND;
+    }
+
+    LoadStatus st = LOAD_INVALID;
+    size_t start = out->len;
+    size_t pos = 0;
+
+    if (n < BYTECODE_MAGIC_LEN || memcmp(data, BYTECODE_MAGIC, BYTECODE_MAGIC_LEN) != 0)
+    {
+        set_err(err, "Invalid bytecode file: bad magic.");
+        goto done;
+    }
+    pos = BYTECODE_MAGIC_LEN;
+
+    int version = pos < n ? data[pos++] : -1;
+    if (version != BYTECODE_VERSION && version != BYTECODE_VERSION_FLAGS)
+    {
+        set_err(err, "Unsupported or invalid bytecode version.");
+        goto done;
+    }
+    int file_flags = 0;
+    if (version == BYTECODE_VERSION_FLAGS)
+    {
+        if (pos >= n)
+        {
+            set_err(err, "Corrupted binary: truncated header.");
+            goto done;
+        }
+        file_flags = data[pos++];
+    }
+    if (flags) *flags = (u8)file_flags;
+
+    while (pos < n)
+    {
+        int c = data[pos++];
+        const OpInfo *oi = vm_info(c);
+        if (oi == nullptr)
+        {
+            set_err(err, "Corrupted binary: invalid opcode detected.");
+            goto done;
+        }
+
+        intptr_t arg = 0;
+        if (oi->arg_type == ARG_STR)
+        {
+            size_t e = pos;
+            while (e < n && data[e] != 0) e++;
+            if (e >= n)
+            {
+                set_err(err, "Corrupted binary: unterminated string.");
+                goto done;
+            }
+            char *s = pool_add(pool, (const char *)data + pos, e - pos);
+            if (s == nullptr) { set_err(err, "Out of memory."); goto done; }
+            arg = (intptr_t)s;
+            pos = e + 1;
+        }
+        else if (oi->arg_type != ARG_NONE)
+        {
+            if (n - pos < 8)
+            {
+                set_err(err, "Corrupted binary: truncated argument.");
+                goto done;
+            }
+            uint64_t val = 0;
+            for (int i = 0; i < 8; i++)
+                val |= (uint64_t)data[pos + (size_t)i] << (i * 8);
+            pos += 8;
+            arg = (intptr_t)(int64_t)val;
+        }
+
+        if (!prog_push(out, (OpCode)c, arg))
+        {
+            set_err(err, "Out of memory.");
+            goto done;
+        }
+    }
+    st = LOAD_OK;
+
+done:
+    if (st != LOAD_OK) out->len = start;
+    free(data);
+    return st;
+}
+
+typedef struct {
+    Prog   prog;
+    Pool   pool;
+    u8     flags;
+
+    char **args;
+    size_t nargs;
+
+    map_t  symbols;
+    map_t  loaded;
+
+    int    label_top;
+    int    var_top;
+    int    pc;
+    int    at;
+    bool   running;
+    bool   failed;
+    int    status;
+    bool   trace;
+    int    heap;
+    int    sp;
+    int    csp;
+
+    intptr_t stack[STACKMAX];
+    int      calls[CALLMAX];
+    intptr_t vars[NREGISTERS];
+    int      labels[NLABELS];
+
+    Stream  *files[MAXFILES];
+} VM;
+
+static void vm_fail(VM *vm, const char *fmt, ...)
+{
+    char msg[ERRBUF];
+    char line[ERRBUF + 96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    snprintf(line, sizeof(line), "Fatal Exception: vm: %s (instruction %d)\n", msg, vm->at);
+    err_str(line);
+
+    vm->running = false;
+    vm->failed = true;
+    vm->status = 1;
+}
+
+static void vm_init(VM *vm)
+{
+    memset(vm, 0, sizeof(*vm));
+    vm->symbols = map_new(16, nullptr);
+    vm->loaded  = map_new(16, nullptr);
+}
+
+static void vm_free(VM *vm)
+{
+    for (int i = 0; i < MAXFILES; i++)
+        if (vm->files[i]) { REMOVE(vm->files[i]); vm->files[i] = nullptr; }
+    map_free(&vm->symbols);
+    map_free(&vm->loaded);
+    for (size_t i = 0; i < vm->pool.len; i++) free(vm->pool.v[i]);
+    free(vm->pool.v);
+    free(vm->prog.v);
+    free(vm->args);
+}
+
+static void vm_show(VM *vm, int i)
+{
+    char buf[64];
+    const Instr *ip = &vm->prog.v[i];
+    const OpInfo *oi = vm_info((int)ip->op);
+
+    if (oi == nullptr)
+    {
+        snprintf(buf, sizeof(buf), "%3d  ???      %d", i, (int)ip->op);
+        out_str(buf);
+        return;
+    }
+    if (oi->arg_type == ARG_NONE)
+    {
+        snprintf(buf, sizeof(buf), "%3d  %s", i, oi->name);
+        out_str(buf);
+        return;
+    }
+
+    snprintf(buf, sizeof(buf), "%3d  %-8s", i, oi->name);
+    out_str(buf);
+    switch (oi->arg_type)
+    {
+        case ARG_NUM:      out_char(' ');  out_int(ip->arg); break;
+        case ARG_STR:      out_str(" \""); out_str((const char *)ip->arg); out_char('"'); break;
+        case ARG_REGISTER: out_str(" r");  out_int(ip->arg); break;
+        case ARG_LABEL:    out_str(" L");  out_int(ip->arg); break;
+        default: break;
+    }
+}
+
+static void vm_list(VM *vm)
+{
+    size_t n = vm->prog.len;
+    if (n > 0 && vm->prog.v[n - 1].op == OP_END) n--;
+    for (size_t i = 0; i < n; i++)
+    {
+        vm_show(vm, (int)i);
+        out_char('\n');
+    }
+}
+
+static void vm_stk(VM *vm)
+{
+    out_str("  [");
+    for (int i = 0; i < vm->sp; i++)
+    {
+        out_char(' ');
+        out_int(vm->stack[i]);
+    }
+    out_str(" ]");
+}
+
+static bool link_module(VM *vm, size_t begin, int base, int var_base)
+{
+    Prog *pg = &vm->prog;
+    int top = 0;
+    int vtop = NRAWREGISTERS;
+
+    for (size_t i = begin; i < pg->len; i++)
+    {
+        vm->at = (int)i;
+        const Instr *ip = &pg->v[i];
+        const OpInfo *oi = vm_info((int)ip->op);
+
+        if (oi == nullptr) { vm_fail(vm, "bad opcode"); return false; }
+        if (oi->arg_type == ARG_REGISTER)
+        {
+            if (ip->arg < 0 || ip->arg >= NREGISTERS) { vm_fail(vm, "register out of range"); return false; }
+            if ((int)ip->arg + 1 > vtop) vtop = (int)ip->arg + 1;
+        }
+        if (oi->arg_type == ARG_LABEL)
+        {
+            if (ip->arg < 0 || ip->arg >= NLABELS) { vm_fail(vm, "label out of range"); return false; }
+            if ((int)ip->arg + 1 > top) top = (int)ip->arg + 1;
+        }
+    }
+    if (base + top > NLABELS) { vm_fail(vm, "too many labels"); return false; }
+
+    const int named = vtop - NRAWREGISTERS;
+    if (NRAWREGISTERS + var_base + named > NREGISTERS) { vm_fail(vm, "too many variables"); return false; }
+
+    for (size_t i = begin; i < pg->len; i++)
+    {
+        const OpInfo *oi = vm_info((int)pg->v[i].op);
+        if (oi->arg_type == ARG_LABEL) pg->v[i].arg += base;
+        if (oi->arg_type == ARG_REGISTER && pg->v[i].arg >= NRAWREGISTERS)
+            pg->v[i].arg += var_base;
+    }
+
+    for (size_t i = begin; i < pg->len; i++)
+    {
+        vm->at = (int)i;
+        const Instr *ip = &pg->v[i];
+        if (ip->op == OP_LABEL)
+        {
+            if (vm->labels[ip->arg] >= 0) { vm_fail(vm, "duplicate label"); return false; }
+            vm->labels[ip->arg] = (int)i;
+        }
+        else if (ip->op == OP_EXPORT)
+        {
+            const char *name = (const char *)ip->arg;
+            if (map_contains_cstr(&vm->symbols, name))
+            {
+                vm_fail(vm, "duplicate symbol '%s'", name);
+                return false;
+            }
+            map_set_cstr(&vm->symbols, name, (void *)(uintptr_t)(i + 1));
+        }
+    }
+
+    for (size_t i = begin; i < pg->len; i++)
+    {
+        vm->at = (int)i;
+        const Instr *ip = &pg->v[i];
+        const OpInfo *oi = vm_info((int)ip->op);
+        if (oi->arg_type == ARG_LABEL && vm->labels[ip->arg] < 0)
+        {
+            vm_fail(vm, "undefined label");
+            return false;
+        }
+    }
+    if (base + top > vm->label_top) vm->label_top = base + top;
+    if (var_base + named > vm->var_top) vm->var_top = var_base + named;
+    return true;
+}
+
+static intptr_t load_module(VM *vm, const char *name)
+{
+    if (map_contains_cstr(&vm->loaded, name)) return 0;
+
+    char err[ERRBUF];
+    size_t begin = vm->prog.len;
+    LoadStatus st = read_module(name, &vm->prog, &vm->pool, err, nullptr);
+    if (st == LOAD_NOT_FOUND) return -1;
+    if (st == LOAD_INVALID)
+    {
+        vm_fail(vm, "load '%s': %s", name, err);
+        return 0;
+    }
+
+    if (!link_module(vm, begin, vm->label_top, vm->var_top)) return 0;
+    map_set_cstr(&vm->loaded, name, (void *)(uintptr_t)1);
+    return 0;
+}
+
+static bool check_addr(VM *vm, intptr_t a, int size)
+{
+    if (a == 0)               { vm_fail(vm, "null pointer"); return false; }
+    if (size == 2 && (a & 1)) { vm_fail(vm, "unaligned word access"); return false; }
+    return true;
+}
+
+static bool read_int(intptr_t *out)
+{
+    int c = in_peek();
+    while (c != -1 && is_space(c)) { in_get(); c = in_peek(); }
+
+    bool neg = false;
+    if (c == '-' || c == '+')
+    {
+        neg = (c == '-');
+        in_get();
+        c = in_peek();
+    }
+    if (c == -1 || !is_digit(c)) return false;
+
+    uint64_t v = 0;
+    while (c != -1 && is_digit(c))
+    {
+        v = v * 10 + (uint64_t)(c - '0');
+        in_get();
+        c = in_peek();
+    }
+    *out = (intptr_t)(neg ? (0 - v) : v);
+    return true;
+}
+
+static intptr_t read_line(u8 *buf, intptr_t size)
+{
+    if (size == 1) { buf[0] = 0; return 0; }
+    intptr_t n = 0;
+    bool got_any = false, got_nl = false;
+    while (n < size - 1)
+    {
+        int c = in_get();
+        if (c == -1) break;
+        got_any = true;
+        if (c == '\n') { got_nl = true; break; }
+        buf[n++] = (u8)c;
+    }
+    if (got_nl && n > 0 && buf[n - 1] == '\r') n--;
+    buf[n] = 0;
+    if (!got_any && n == 0) return -1;
+    return n;
+}
+
+static intptr_t vm_open(VM *vm, const char *path, intptr_t mode)
+{
+    const char *m = mode == 0 ? "r" : mode == 1 ? "w" : "r+";
+    int slot = -1;
+    for (int i = 3; i < MAXFILES; i++)
+        if (vm->files[i] == nullptr) { slot = i; break; }
+    if (slot < 0) return -1;
+
+    Stream *s = fopen_str(path, m);
+    if (s == nullptr) return -1;
+    vm->files[slot] = s;
+    return slot;
+}
+
+static intptr_t vm_close(VM *vm, intptr_t fd)
+{
+    if (fd >= 0 && fd <= 2) return 0;
+    if (fd < 3 || fd >= MAXFILES || vm->files[fd] == nullptr) return -1;
+    Stream *s = vm->files[fd];
+    vm->files[fd] = nullptr;
+    CALL0(s, close);
+    REMOVE(s);
+    return 0;
+}
+
+static intptr_t vm_unlink(const char *path)
+{
+#if defined(_WIN32)
+    return DeleteFileA(path) ? 0 : -1;
+#elif defined(XXC_RAWSYS)
+    return sys_unlink(path) == 0 ? 0 : -1;
+#else
+    (void)path;
+    return -1;
+#endif
+}
+
+static intptr_t vm_read(VM *vm, intptr_t fd, void *buf, size_t n)
+{
+    if (fd == 0)
+    {
+        if (n == 0) return 0;
+        if (g_in_pos < g_in_len)
+        {
+            size_t avail = g_in_len - g_in_pos;
+            size_t k = n < avail ? n : avail;
+            memcpy(buf, g_in + g_in_pos, k);
+            g_in_pos += k;
+            return (intptr_t)k;
+        }
+        out_flush();
+        Stream *si = cin();
+        return (intptr_t)CALL2(si, read, buf, n);
+    }
+    if (fd < 3 || fd >= MAXFILES || vm->files[fd] == nullptr) return -1;
+    Stream *s = vm->files[fd];
+    return (intptr_t)CALL2(s, read, buf, n);
+}
+
+static intptr_t vm_write(VM *vm, intptr_t fd, const u8 *p, intptr_t n)
+{
+    if (fd == 1)
+    {
+        out_write(p, (size_t)n);
+        return n;
+    }
+    if (fd == 2)
+    {
+        out_flush();
+        Stream *se = cerr();
+        intptr_t done = 0;
+        while (done < n)
+        {
+            i64 k = CALL2(se, write, p + done, (size_t)(n - done));
+            if (k <= 0) break;
+            done += (intptr_t)k;
+        }
+        return (done == 0 && n > 0) ? -1 : done;
+    }
+    if (fd < 3 || fd >= MAXFILES || vm->files[fd] == nullptr) return -1;
+
+    Stream *s = vm->files[fd];
+    intptr_t done = 0;
+    while (done < n)
+    {
+        i64 k = CALL2(s, write, p + done, (size_t)(n - done));
+        if (k <= 0) break;
+        done += (intptr_t)k;
+    }
+    return (done == 0 && n > 0) ? -1 : done;
+}
+
+static intptr_t alu(VM *vm, OpCode op, intptr_t a, intptr_t b)
+{
+    uintptr_t ua = (uintptr_t)a, ub = (uintptr_t)b;
+    switch (op)
+    {
+        case OP_ADD: return (intptr_t)(ua + ub);
+        case OP_SUB: return (intptr_t)(ua - ub);
+        case OP_MUL: return (intptr_t)(ua * ub);
+        case OP_DIV:
+        case OP_MOD:
+            if (b == 0) { vm_fail(vm, "division by zero"); return 0; }
+            if (b == -1) return op == OP_DIV ? (intptr_t)(0 - ua) : 0;
+            return op == OP_DIV ? a / b : a % b;
+        case OP_EQ:  return a == b;
+        case OP_NE:  return a != b;
+        case OP_LT:  return a < b;
+        case OP_GT:  return a > b;
+        case OP_LE:  return a <= b;
+        case OP_GE:  return a >= b;
+        case OP_ULT: return ua <  ub;
+        case OP_ULE: return ua <= ub;
+        case OP_UGT: return ua >  ub;
+        case OP_UGE: return ua >= ub;
+        case OP_AND: return a & b;
+        case OP_OR:  return a | b;
+        case OP_XOR: return a ^ b;
+        case OP_SHL:
+            if (ub >= VM_WORD_BITS) return 0;
+            return (intptr_t)(ua << ub);
+        case OP_SHR:
+            if (ub >= VM_WORD_BITS) return 0;
+            return (intptr_t)(ua >> ub);
+        case OP_SAR:
+            if (ub >= VM_WORD_BITS) return a < 0 ? -1 : 0;
+            return a >> ub;
+        default: return 0;
+    }
+}
+
+#define PUSH(x) (vm->stack[vm->sp++] = (x))
+#define POP()   (vm->stack[--vm->sp])
+#define FAIL(...) do { vm_fail(vm, __VA_ARGS__); return; } while (0)
+#define CHECK_ADDR(a, sz) do { if (!check_addr(vm, (a), (sz))) return; } while (0)
+
+static void step(VM *vm)
+{
+    vm->at = vm->pc;
+    if (vm->pc < 0 || (size_t)vm->pc >= vm->prog.len)
+        FAIL("program counter out of range");
+
+    const Instr ip = vm->prog.v[vm->pc];
+    const OpInfo *oi = vm_info((int)ip.op);
+    if (oi == nullptr) FAIL("bad opcode");
+
+    if (vm->trace)
+    {
+        vm_show(vm, vm->pc);
+        vm_stk(vm);
+        out_char('\n');
+    }
+
+    if (vm->sp < oi->pop_count) FAIL("stack underflow");
+    if (vm->sp - oi->pop_count + oi->push_count > STACKMAX) FAIL("stack overflow");
+
+    vm->pc++;
+    intptr_t a, b;
+    u8 *p;
+
+    switch (ip.op)
+    {
+        case OP_END:  vm->running = false; break;
+        case OP_HALT: vm->running = false; vm->status = (int)ip.arg; break;
+        case OP_NOP:
+        case OP_LABEL:
+        case OP_EXPORT:
+            break;
+
+        case OP_PUSH:
+        case OP_PUSHS: PUSH(ip.arg); break;
+        case OP_POP:   (void)POP(); break;
+        case OP_DUP:   a = POP(); PUSH(a); PUSH(a); break;
+        case OP_SWAP:  b = POP(); a = POP(); PUSH(b); PUSH(a); break;
+        case OP_OVER:  b = POP(); a = POP(); PUSH(a); PUSH(b); PUSH(a); break;
+
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+        case OP_EQ:  case OP_NE:  case OP_LT:  case OP_GT:  case OP_LE:
+        case OP_GE:  case OP_AND: case OP_OR:
+        case OP_XOR: case OP_SHL: case OP_SHR: case OP_SAR:
+        case OP_ULT: case OP_ULE: case OP_UGT: case OP_UGE:
+            b = POP();
+            a = POP();
+            a = alu(vm, ip.op, a, b);
+            if (vm->running) PUSH(a);
+            break;
+        case OP_NEG:  a = POP(); PUSH((intptr_t)(0 - (uintptr_t)a)); break;
+        case OP_NOT:  a = POP(); PUSH(!a); break;
+        case OP_BNOT: a = POP(); PUSH(~a); break;
+
+        case OP_LOAD:  PUSH(vm->vars[ip.arg]); break;
+        case OP_STORE: vm->vars[ip.arg] = POP(); break;
+
+        case OP_JMP: vm->pc = vm->labels[ip.arg]; break;
+        case OP_JZ:  if (POP() == 0) vm->pc = vm->labels[ip.arg]; break;
+        case OP_JNZ: if (POP() != 0) vm->pc = vm->labels[ip.arg]; break;
+
+        case OP_CALL:
+            if (vm->csp >= CALLMAX) FAIL("call stack overflow");
+            vm->calls[vm->csp++] = vm->pc;
+            vm->pc = vm->labels[ip.arg];
+            break;
+        case OP_CALLX:
+        {
+            const char *name = (const char *)ip.arg;
+            uintptr_t idx = (uintptr_t)map_get_cstr(&vm->symbols, name);
+            if (idx == 0) FAIL("undefined symbol '%s'", name);
+            if (vm->csp >= CALLMAX) FAIL("call stack overflow");
+            vm->calls[vm->csp++] = vm->pc;
+            vm->pc = (int)(idx - 1);
+            break;
+        }
+        case OP_LOADMOD:
+        {
+            intptr_t r = load_module(vm, (const char *)ip.arg);
+            if (vm->failed) return;
+            PUSH(r);
+            break;
+        }
+        case OP_RET:
+            if (vm->csp == 0) FAIL("return without call");
+            vm->pc = vm->calls[--vm->csp];
+            break;
+
+        case OP_ARGC:
+            PUSH((intptr_t)vm->nargs);
+            break;
+        case OP_ARGV:
+            a = POP();
+            if (a < 0 || (size_t)a >= vm->nargs) PUSH(0);
+            else PUSH((intptr_t)vm->args[(size_t)a]);
+            break;
+
+        case OP_MKHEAP:
+            a = POP();
+            if (a < 0) FAIL("bad heap size");
+            p = (u8 *)malloc((size_t)a);
+            if (p != nullptr) vm->heap++;
+            PUSH((intptr_t)p);
+            break;
+        case OP_RMHEAP:
+            a = POP();
+            if (a != 0) { free((void *)a); vm->heap--; }
+            break;
+
+        case OP_LOADW:
+            a = POP();
+            CHECK_ADDR(a, 2);
+            p = (u8 *)a;
+            PUSH((intptr_t)(i16)(p[0] | (p[1] << 8)));
+            break;
+        case OP_STOREW:
+            b = POP(); a = POP();
+            CHECK_ADDR(a, 2);
+            p = (u8 *)a;
+            p[0] = (u8)(b & 0xFF);
+            p[1] = (u8)((b >> 8) & 0xFF);
+            break;
+        case OP_LOADB:
+            a = POP();
+            CHECK_ADDR(a, 1);
+            PUSH(((u8 *)a)[0]);
+            break;
+        case OP_STOREB:
+            b = POP(); a = POP();
+            CHECK_ADDR(a, 1);
+            ((u8 *)a)[0] = (u8)(b & 0xFF);
+            break;
+
+        case OP_PRINTI: out_int(POP()); break;
+        case OP_PRINTC: out_char((char)POP()); break;
+        case OP_PRINTS:
+            a = POP(); CHECK_ADDR(a, 1);
+            out_str((const char *)a);
+            break;
+        case OP_PRINTLN:
+            a = POP(); CHECK_ADDR(a, 1);
+            out_str((const char *)a);
+            out_char('\n');
+            break;
+        case OP_NEWLINE: out_char('\n'); break;
+
+        case OP_READI:
+        {
+            intptr_t v = 0;
+            bool ok = read_int(&v);
+            PUSH(ok ? v : 0);
+            PUSH(ok ? 1 : 0);
+            break;
+        }
+        case OP_READC:
+            PUSH(in_get());
+            break;
+        case OP_READLN:
+            b = POP(); a = POP();
+            CHECK_ADDR(a, 1);
+            if (b <= 0) FAIL("bad buffer size");
+            PUSH(read_line((u8 *)a, b));
+            break;
+
+        case OP_OPEN:
+            b = POP(); a = POP();
+            CHECK_ADDR(a, 1);
+            if (b < 0 || b > 2) FAIL("bad open mode");
+            PUSH(vm_open(vm, (const char *)a, b));
+            break;
+        case OP_CLOSE:
+            a = POP();
+            PUSH(vm_close(vm, a));
+            break;
+        case OP_UNLINK:
+            a = POP();
+            CHECK_ADDR(a, 1);
+            PUSH(vm_unlink((const char *)a));
+            break;
+        case OP_READ:
+        {
+            intptr_t n = POP();
+            b = POP(); a = POP();
+            CHECK_ADDR(b, 1);
+            if (n < 0) FAIL("bad count");
+            PUSH(vm_read(vm, a, (void *)b, (size_t)n));
+            break;
+        }
+        case OP_WRITE:
+        {
+            intptr_t n = POP();
+            b = POP(); a = POP();
+            CHECK_ADDR(b, 1);
+            if (n < 0) FAIL("bad count");
+            PUSH(vm_write(vm, a, (const u8 *)b, n));
+            break;
+        }
+
+        default:
+            FAIL("bad opcode");
+    }
+}
+
+static int vm_run(VM *vm)
+{
+    for (int i = 0; i < NLABELS; i++) vm->labels[i] = -1;
+    vm->label_top = 0;
+    vm->var_top = 0;
+    map_clear(&vm->symbols);
+    map_clear(&vm->loaded);
+
+    if (!link_module(vm, 0, 0, 0)) return vm->status;
+
+    vm->pc = 0;
+    vm->running = true;
+    while (vm->running) step(vm);
+
+    if (!vm->failed && vm->heap > 0)
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "vm: warning: %d heap block(s) not freed\n", vm->heap);
+        err_str(buf);
+    }
+    return vm->status;
+}
+
+static int pvm_main(int argc, char **argv)
+{
+    bool list = false;
+    bool trace = false;
+    const char *filename = "p.out";
+
+    int i = 1;
+    for (; i < argc; i++)
+    {
+        const char *arg = argv[i];
+        if (strcmp(arg, "-t") == 0)       trace = true;
+        else if (strcmp(arg, "-d") == 0)  list = true;
+        else if (strcmp(arg, "--") == 0)  { i++; break; }
+        else if (arg[0] != '-')           break;
+        else
+        {
+            err_str("usage: vm [-t] [-d] [prog.bin [args...]]\n");
+            return 2;
+        }
+    }
+    if (i < argc) filename = argv[i++];
+
+    static VM vm;
+    vm_init(&vm);
+
+    int rc = 0;
+    char err[ERRBUF];
+    if (read_module(filename, &vm.prog, &vm.pool, err, &vm.flags) != LOAD_OK)
+    {
+        err_str(err);
+        err_str("\n");
+        rc = 1;
+        goto out;
+    }
+
+    if (!list)
+    {
+        if (vm.flags & FLAG_ARGS)
+        {
+            size_t extra = (size_t)(argc - i);
+            vm.args = (char **)malloc((extra + 1) * sizeof(char *));
+            if (vm.args == nullptr) { err_str("vm: out of memory\n"); rc = 1; goto out; }
+            vm.args[0] = (char *)filename;
+            for (size_t k = 0; k < extra; k++) vm.args[k + 1] = argv[(size_t)i + k];
+            vm.nargs = extra + 1;
+        }
+        else if (i < argc)
+        {
+            err_str("vm: ");
+            err_str(filename);
+            err_str(" does not accept arguments (it needs the 'args' directive)\n");
+            rc = 2;
+            goto out;
+        }
+    }
+
+    vm.trace = trace;
+    if (list) { vm_list(&vm); rc = 0; }
+    else      rc = vm_run(&vm);
+
+out:
+    vm_free(&vm);
+    return rc;
+}
+
+int program(parr_t csArgs)
+{
+    int rc = pvm_main((int)csArgs.len, (char **)csArgs.data);
+    out_flush();
+    return rc;
+}

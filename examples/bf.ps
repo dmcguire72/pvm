@@ -1,0 +1,86 @@
+args
+
+import "../lib/bf.ps"
+extern run_bf
+
+var fd, path, file_buf, read_len, exit_code
+
+argc
+push 2
+gt
+jz argc_ok
+    push 2
+    pushs "usage: bf [program.bf]\n"
+    push 23
+    write
+    pop
+    halt 2
+
+argc_ok:
+argc
+push 2
+eq
+jz default_path
+    push 1
+    argv
+    store path
+    jmp path_done
+default_path:
+    pushs "program.bf"
+    store path
+path_done:
+
+load path
+push 0
+open
+store fd
+
+load fd
+push 0
+lt
+jz file_ok
+    pushs "Error: cannot open "
+    prints
+    load path
+    println
+    halt 1
+
+file_ok:
+push 16384
+mkheap
+store file_buf
+
+load fd
+load file_buf
+push 16383
+read
+store read_len
+
+load fd
+close
+pop
+
+load read_len
+push 0
+lt
+jz read_ok
+    pushs "Error: cannot read file\n"
+    prints
+    load file_buf
+    rmheap
+    halt 1
+
+read_ok:
+load file_buf
+call run_bf
+
+store exit_code
+
+load file_buf
+rmheap
+
+load exit_code
+jz success
+    halt 1
+success:
+    halt 0

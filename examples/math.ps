@@ -1,0 +1,83 @@
+extern abs, pow, sqrt, floor_div, ceil_div, round_div, srand, randn
+import "../lib/mathlib.ps"
+
+var rolled
+
+call main
+halt 0
+
+main:
+    pushs "abs(-7) = "
+    prints
+    push -7
+    call abs
+    printi
+    newline
+    pushs "2^10 = "
+    prints
+    push 2
+    push 10
+    call pow
+    printi
+    newline
+    pushs "sqrt(1000) = "
+    prints
+    push 1000
+    call sqrt
+    printi
+    newline
+
+    pushs "-7 / 2:  div="
+    prints
+    push -7
+    push 2
+    div
+    printi
+    pushs "  floor="
+    prints
+    push -7
+    push 2
+    call floor_div
+    printi
+    pushs "  ceil="
+    prints
+    push -7
+    push 2
+    call ceil_div
+    printi
+    pushs "  round="
+    prints
+    push -7
+    push 2
+    call round_div
+    printi
+    newline
+
+    push 42
+    call srand
+    pushs "dice:"
+    prints
+    push 0
+    store rolled
+roll:
+    load rolled
+    push 8
+    ge
+    jnz rolls_done
+    pushs " "
+    prints
+    push 6
+    call randn
+    push 1
+    add
+    printi
+    load rolled
+    push 1
+    add
+    store rolled
+    jmp roll
+rolls_done:
+    newline
+    ret
+
+end

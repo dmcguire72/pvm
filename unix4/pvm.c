@@ -1,5 +1,5 @@
 #define NULL 0
-#include "example/pvm-common.h"
+#include "unix4/pvm-common.h"
 
 struct VM {
 	struct Instr *vm_prog;
